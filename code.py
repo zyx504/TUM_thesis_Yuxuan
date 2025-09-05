@@ -6,8 +6,8 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 from shapely.geometry import Point
 from matplotlib.colors import LinearSegmentedColormap, Normalize, to_hex
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import train_test_split, cross_val_score, KFold
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, make_scorer
 import warnings
 
 warnings.filterwarnings('ignore', category=FutureWarning)
@@ -32,9 +32,10 @@ X = df[features_with_coords]
 y = df[target]
 
 # --- 3. Train-Test Split ---
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=pd.qcut(y, 5))
 
-# --- 4. Train XGBoost Model ---
+# --- 4. 5-Fold Cross-Validation ---
+print("Performing 5-fold cross-validation...")
 model = xgb.XGBRegressor(
     objective='reg:squarederror',
     n_estimators=1000,
@@ -46,19 +47,43 @@ model = xgb.XGBRegressor(
     n_jobs=-1,
     eval_metric='rmse'
 )
+
+# Define scoring metrics
+scoring = {
+    'r2': make_scorer(r2_score),
+    'rmse': make_scorer(lambda y_true, y_pred: np.sqrt(mean_squared_error(y_true, y_pred))),
+    'mae': make_scorer(mean_absolute_error)
+}
+
+# Perform cross-validation
+kfold = KFold(n_splits=5, shuffle=True, random_state=42)
+cv_results = {}
+for metric_name, scorer in scoring.items():
+    scores = cross_val_score(model, X_train, y_train, cv=kfold, scoring=scorer, n_jobs=-1)
+    cv_results[metric_name] = scores
+    print(f"{metric_name.upper()} - Cross-validation scores: {scores}")
+    print(f"{metric_name.upper()} - Mean: {scores.mean():.4f} (±{scores.std():.4f})")
+
+# --- 5. Train Final Model ---
+print("\nTraining final model on full training set...")
 model.fit(X_train, y_train, verbose=False)
 
-# --- 5. Model Evaluation ---
+# --- 6. Model Evaluation on Test Set ---
 y_pred = model.predict(X_test)
-print("R2:", r2_score(y_test, y_pred),
-      "RMSE:", np.sqrt(mean_squared_error(y_test, y_pred)),
-      "MAE:", mean_absolute_error(y_test, y_pred))
+test_r2 = r2_score(y_test, y_pred)
+test_rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+test_mae = mean_absolute_error(y_test, y_pred)
 
-# --- 6. SHAP Values ---
+print("\nTest Set Performance:")
+print(f"R2: {test_r2:.4f}")
+print(f"RMSE: {test_rmse:.4f}")
+print(f"MAE: {test_mae:.4f}")
+
+# --- 7. SHAP Values ---
 explainer = shap.Explainer(model)
 shap_values = explainer(X)
 
-# --- 7. Create GeoDataFrame ---
+# --- 8. Create GeoDataFrame ---
 gdf_wgs84 = gpd.GeoDataFrame(
     df,
     geometry=[Point(xy) for xy in zip(df['Longitude'], df['Latitude'])],
@@ -69,7 +94,7 @@ gdf = gdf_wgs84.to_crs("EPSG:3857").reset_index(drop=True)
 shap_df = pd.DataFrame(shap_values.values, columns=[f'{col}_shap' for col in X.columns])
 df_plot = pd.concat([df.reset_index(drop=True), shap_df.reset_index(drop=True)], axis=1)
 
-# --- 8. Global Color Mapping ---
+# --- 9. Global Color Mapping ---
 global_min = np.nanmin(shap_df.values)
 global_max = np.nanmax(shap_df.values)
 total_range = global_max - global_min
@@ -92,7 +117,7 @@ norm = Normalize(vmin=global_min, vmax=global_max)
 def shap_to_hex(val):
     return to_hex(custom_cmap(norm(val)))
 
-# --- 9. Point Size Mapping (6 Quantile Classes) ---
+# --- 10. Point Size Mapping (6 Quantile Classes) ---
 SIZE_CLASSES = [8, 13, 18, 22, 27, 32]
 
 def size_from_feature_quantile(arr, feature_name):
@@ -120,7 +145,7 @@ def size_from_feature_quantile(arr, feature_name):
 
     return sizes
 
-# --- 10. Generate Color & Size Fields ---
+# --- 11. Generate Color & Size Fields ---
 for feature in features_with_coords:
     shap_col = f'{feature}_shap'
     vals = df_plot[shap_col].to_numpy()
@@ -129,7 +154,7 @@ for feature in features_with_coords:
     df_plot[f'{feature}_color'] = [shap_to_hex(v) for v in vals]
     df_plot[f'{feature}_size'] = size_from_feature_quantile(feature_vals, feature)
 
-# --- 11. Export to GeoPackage ---
+# --- 12. Export to GeoPackage ---
 out_path = r"D:\zyxthesis\shap_output"
 out_file = "shap_results_zzzz.gpkg"
 
@@ -147,7 +172,7 @@ gdf_export.to_file(
 
 print("Exported GeoPackage, can be loaded directly in ArcGIS Pro:", f"{out_path}\\{out_file}")
 
-# --- 12. Mean Absolute SHAP Bar Plot ---
+# --- 13. Mean Absolute SHAP Bar Plot ---
 print("Generating mean absolute SHAP bar plot...")
 mean_abs_shap = pd.Series(np.abs(shap_values.values).mean(axis=0), index=X.columns)
 mean_abs_shap = mean_abs_shap.sort_values(ascending=True)
@@ -162,7 +187,7 @@ plt.savefig('shap_mean_absolute_bar_chart.png', dpi=300)
 plt.close()
 print("Feature importance bar chart saved as 'shap_mean_absolute_bar_chart.png'")
 
-# --- 13. SHAP Summary Plot ---
+# --- 14. SHAP Summary Plot ---
 print("Generating SHAP summary plot...")
 plt.figure(figsize=(10, 8))
 shap.summary_plot(shap_values, X, show=False, plot_size=None)
